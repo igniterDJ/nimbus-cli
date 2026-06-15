@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Launcher for nimbus. Prefers this repo's .venu (which has the openai SDK),
+# falls back to system python3. Pass any args/flags straight through.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$DIR/.venu/bin/python" ]; then
+  PY="$DIR/.venu/bin/python"
+else
+  PY="$(command -v python3)"
+fi
+exec "$PY" "$DIR/nimbus.py" "$@"

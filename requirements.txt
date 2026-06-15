@@ -1,0 +1,3 @@
+# Only needed for chat.py (the standalone API smoke test).
+# proxy.py uses the standard library exclusively.
+openai>=1.30
