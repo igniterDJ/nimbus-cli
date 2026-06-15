@@ -1,3 +1,6 @@
 # Only needed for chat.py (the standalone API smoke test).
 # proxy.py uses the standard library exclusively.
 openai>=1.30
+rich>=13              # Prompt 1: streaming Markdown rendering + syntax highlighting
+# Optional: install for MCP (Model Context Protocol) stdio server support
+# mcp>=1.0             # Prompt 6: MCP support — pip install mcp
