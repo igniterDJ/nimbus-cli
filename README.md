@@ -13,19 +13,29 @@ No build step. No Electron. One Python file + the `openai` SDK.
 
 ## Quick start
 
+**1. Clone and install**
 ```bash
 git clone https://github.com/igniterDJ/nimbus-cli
 cd nimbus-cli
 python3 -m venv .venu && .venu/bin/pip install -r requirements.txt
-export NVIDIA_API_KEY=nvapi-...
+```
+
+**2. Create a `.env` file with your key and model**
+```bash
+cat > .env << 'EOF'
+NVIDIA_API_KEY=nvapi-...
+NIMBUS_MODEL=qwen/qwen3.5-122b-a10b
+EOF
+```
+Get your API key at [build.nvidia.com](https://build.nvidia.com).
+Full model list is there too — click any model and copy its API name.
+
+**3. Run it**
+```bash
 ./nimbus ~/your/project
 ```
 
-Or drop your key in a `.env` file (gitignored):
-```
-NVIDIA_API_KEY=nvapi-...
-NIMBUS_MODEL=qwen/qwen3.5-122b-a10b
-```
+That's it. The key and model are picked up from `.env` automatically on every run — no `export` needed.
 
 ## What it does
 
