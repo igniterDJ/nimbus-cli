@@ -530,6 +530,12 @@ class Agent:
             "style. Do not reformat unrelated code.\n"
             "- Work step by step: explore, read what you need, edit, then if useful run a command "
             "to verify (build/lint/tests).\n"
+            "- ANSWERING QUESTIONS about the code (e.g. 'is X implemented?', 'what does Y do?'): "
+            "FIRST consult the 'Repo map (symbols)' and project layout already provided above — they "
+            "list the functions and classes that exist. Confirm with at most a few targeted searches, "
+            "then give a clear final answer. Do NOT keep re-searching to re-verify facts you already "
+            "established, and do NOT issue one tiny search per step — batch your investigation, then "
+            "STOP and answer. Once you have enough evidence, reply with your conclusion and no tool calls.\n"
             "- Paths are relative to the project root unless absolute.\n"
             "- When done, give a brief plain-text summary of what you changed and why. Do not "
             "dump entire files back to the user.\n"
@@ -1433,21 +1439,14 @@ class Agent:
                             if tc_delta.function.arguments:
                                 tc_accum[idx]["arguments"] += tc_delta.function.arguments
 
-                # --- reasoning delta (some NIM models) ---
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                    if _TTY:
-                        sys.stdout.write(f"{DIM}{delta.reasoning_content}{RESET}")
-                        sys.stdout.flush()
-                    else:
-                        sys.stdout.write(delta.reasoning_content)
-                        sys.stdout.flush()
-                if hasattr(delta, "reasoning") and delta.reasoning:
-                    if _TTY:
-                        sys.stdout.write(f"{DIM}{delta.reasoning}{RESET}")
-                        sys.stdout.flush()
-                    else:
-                        sys.stdout.write(delta.reasoning)
-                        sys.stdout.flush()
+                # --- reasoning delta (some NIM models expose chain-of-thought) ---
+                # gpt-oss and others may populate BOTH `reasoning_content` and
+                # `reasoning` with the SAME text per chunk — emit only one, else
+                # every reasoning token prints twice ("WeWe need need ...").
+                rtext = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if rtext:
+                    sys.stdout.write(f"{DIM}{rtext}{RESET}" if _TTY else rtext)
+                    sys.stdout.flush()
 
         except KeyboardInterrupt:
             pass  # surface gracefully
