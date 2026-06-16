@@ -1145,18 +1145,29 @@ class Agent:
         except re.error as e:
             return f"ERROR: bad regex: {e}"
         hits: list[str] = []
-        for dirpath, dirnames, filenames in os.walk(base):
-            dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
-            for fn in filenames:
-                fp = Path(dirpath) / fn
-                try:
-                    for i, line in enumerate(fp.read_text(errors="ignore").splitlines(), 1):
-                        if rx.search(line):
-                            hits.append(f"{self._rel(fp)}:{i}: {line.strip()[:200]}")
-                            if len(hits) >= 200:
-                                return "\n".join(hits) + "\n...[capped at 200 matches]"
-                except Exception:
-                    continue
+
+        def _scan_file(fp: Path) -> bool:
+            """Scan one file; append matches. Returns True if the 200-match cap was hit."""
+            try:
+                for i, line in enumerate(fp.read_text(errors="ignore").splitlines(), 1):
+                    if rx.search(line):
+                        hits.append(f"{self._rel(fp)}:{i}: {line.strip()[:200]}")
+                        if len(hits) >= 200:
+                            return True
+            except Exception:
+                pass
+            return False
+
+        if base.is_file():
+            # os.walk yields nothing for a file path, so scan it directly.
+            _scan_file(base)
+        else:
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+                if any(_scan_file(Path(dirpath) / fn) for fn in filenames):
+                    break
+        if len(hits) >= 200:
+            return "\n".join(hits) + "\n...[capped at 200 matches]"
         return "\n".join(hits) if hits else "(no matches)"
 
     def _tool_repo_map(self, path: str = ".") -> str:
