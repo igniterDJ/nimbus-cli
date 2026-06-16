@@ -1399,6 +1399,8 @@ class Agent:
         content_buf = ""
         tc_accum: dict[int, dict] = {}  # index → {id, name, arguments}
         usage = None
+        streamed_content = False  # did we write assistant content to stdout live?
+        streamed_reasoning = False  # did we stream chain-of-thought to stdout live?
 
         try:
             for chunk in stream:
@@ -1423,6 +1425,7 @@ class Agent:
                         # non-Rich or piped: stream content as it arrives
                         sys.stdout.write(delta.content)
                         sys.stdout.flush()
+                        streamed_content = True
                     # Rich TTY: stay silent; content rendered once after stream ends
 
                 # --- tool_calls delta ---
@@ -1447,14 +1450,22 @@ class Agent:
                 if rtext:
                     sys.stdout.write(f"{DIM}{rtext}{RESET}" if _TTY else rtext)
                     sys.stdout.flush()
+                    streamed_reasoning = True
 
         except KeyboardInterrupt:
             pass  # surface gracefully
+
+        # Reasoning streams without a trailing newline; add one so the next
+        # tool announce / rendered answer doesn't glue onto the last thought.
+        if streamed_reasoning:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         # Newline after streamed chars (non-Rich paths wrote directly to stdout)
         if content_buf and not (_TTY and _RICH):
             sys.stdout.write("\n")
             sys.stdout.flush()
+        self._streamed_content = streamed_content
 
         # Build tool_calls list in index order
         tool_calls_list = []
@@ -1536,8 +1547,8 @@ class Agent:
                 if _TTY and _RICH:
                     # Rich: nothing was written during streaming, render prose now
                     console.print(Markdown(prose))
-                elif native_calls:
-                    pass  # non-Rich: prose already streamed to stdout, skip
+                elif native_calls or getattr(self, "_streamed_content", False):
+                    pass  # non-Rich: prose already streamed live to stdout, don't duplicate
                 else:
                     print(f"\n{prose}\n")  # text-format calls: stripped prose not yet shown
 
