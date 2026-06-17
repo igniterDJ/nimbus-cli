@@ -833,10 +833,10 @@ class Agent:
         self.usage["requests"] += 1
 
     def _estimate_context_tokens(self) -> int:
-        """Rough token estimate over self.messages (~4 chars/token + 200/tool_call)."""
+        """Rough token estimate over self.messages (~3 chars/token for code + 200/tool_call)."""
         total = 0
         for m in self.messages:
-            total += len(str(m.get("content") or "")) // 4
+            total += len(str(m.get("content") or "")) // 3
             total += 200 * len(m.get("tool_calls", []))
         self.context_tokens = total
         return total
@@ -1099,6 +1099,16 @@ class Agent:
             slice_lines = all_lines[:2000]
             numbered = "\n".join(f"{i + 1}\t{ln}" for i, ln in enumerate(slice_lines))
             numbered += f"\n... file has {total} lines; call read_file with offset/limit to read more."
+            # Prepend a function/class map for Python files so the model can
+            # jump to the right section without re-reading.
+            if p.suffix == ".py":
+                defs = [(i + 1, ln) for i, ln in enumerate(all_lines)
+                        if ln.startswith("def ") or ln.startswith("class ")
+                        or (ln.startswith("    def ") or ln.startswith("    async def "))]
+                if defs:
+                    outline = "\n".join(f"  Line {n}: {ln.rstrip()}" for n, ln in defs[:60])
+                    numbered = (f"[Python outline ({total} lines) — use read_file offset/limit to read a section:]\n"
+                                f"{outline}\n\n") + numbered
             return numbered
 
         start = max(0, offset - 1)
@@ -1108,14 +1118,24 @@ class Agent:
         if whole_file and byte_truncated:
             numbered += f"\n... [truncated at {MAX_READ_BYTES} bytes]"
 
-        # For whole-file reads of large files with headings, prepend a section map
-        # so the model can jump to the right section immediately.
+        # For whole-file reads of large files, prepend a section map so the
+        # model can jump to the right section immediately.
         if whole_file and total > 80:
-            headings = [(i + 1, ln) for i, ln in enumerate(all_lines) if ln.startswith("#")]
-            if len(headings) >= 2:
-                outline = "\n".join(f"  Line {n}: {ln}" for n, ln in headings)
-                numbered = (f"[Section outline — use read_file with offset/limit to jump to a section:]\n"
-                            f"{outline}\n\n") + numbered
+            # Python files: show def/class outline (they don't use # headings)
+            if p.suffix == ".py" and total > 500:
+                defs = [(i + 1, ln) for i, ln in enumerate(all_lines)
+                        if ln.startswith("def ") or ln.startswith("class ")
+                        or ln.startswith("    def ") or ln.startswith("    async def ")]
+                if defs:
+                    outline = "\n".join(f"  Line {n}: {ln.rstrip()}" for n, ln in defs[:60])
+                    numbered = (f"[Python outline ({total} lines) — use read_file offset/limit to read a section:]\n"
+                                f"{outline}\n\n") + numbered
+            else:
+                headings = [(i + 1, ln) for i, ln in enumerate(all_lines) if ln.startswith("#")]
+                if len(headings) >= 2:
+                    outline = "\n".join(f"  Line {n}: {ln}" for n, ln in headings)
+                    numbered = (f"[Section outline — use read_file with offset/limit to jump to a section:]\n"
+                                f"{outline}\n\n") + numbered
         return numbered
 
     def _tool_write_file(self, path: str, content: str) -> str:
@@ -1993,6 +2013,8 @@ class Agent:
         _produced = False  # did this turn yield any content or tool call at all?
         _last_sig: str | None = None
         _repeat: int = 0
+        _ro_since_write: int = 0   # read-only tool calls since last write op
+        _READ_ONLY = {"list_directory", "find_files", "read_file", "search"}
         for _ in range(MAX_ITERS):
             self._compact_history()
             try:
@@ -2060,8 +2082,7 @@ class Agent:
                     else:
                         _last_sig = sig
                         _repeat = 1
-                    _read_only = {"list_directory", "find_files", "read_file", "search"}
-                    _loop_limit = 6 if name in _read_only else 3
+                    _loop_limit = 6 if name in _READ_ONLY else 3
                     if _repeat >= _loop_limit:
                         warn(f"(loop: {name} called with same args {_repeat}× — aborting turn)")
                         save_session(self)
@@ -2070,6 +2091,14 @@ class Agent:
                     result = self._dispatch(name, args)
                     self.messages.append({"role": "tool", "tool_call_id": tc["id"],
                                           "content": str(result)})
+                    if name in _READ_ONLY:
+                        _ro_since_write += 1
+                        if _ro_since_write == 5:
+                            warn("(hint: 5 read-only calls with no edits yet — "
+                                 "if stuck, use /max for a more capable model, "
+                                 "or tell me the exact file and function name to edit)")
+                    else:
+                        _ro_since_write = 0
             else:
                 # Text-format path: report results back as a user message, since
                 # there are no tool_call ids for role:"tool" messages to reference.
@@ -2078,6 +2107,14 @@ class Agent:
                     self._announce(name, args)
                     result = self._dispatch(name, args)
                     results.append(f"[{name}] -> {result}")
+                    if name in _READ_ONLY:
+                        _ro_since_write += 1
+                        if _ro_since_write == 5:
+                            warn("(hint: 5 read-only calls with no edits yet — "
+                                 "if stuck, use /max for a more capable model, "
+                                 "or tell me the exact file and function name to edit)")
+                    else:
+                        _ro_since_write = 0
                 self.messages.append({
                     "role": "user",
                     "content": "Tool results (continue, or give your final summary):\n\n"
