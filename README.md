@@ -67,7 +67,7 @@ That's it. The key and model are picked up from `.env` automatically on every ru
 | `folder` | Project folder to work in (default: current dir) |
 | `--auto` | Start in autonomous mode (apply edits & run commands without asking) |
 | `--plan` | Start in plan mode (read-only investigation; `/build` to execute) |
-| `--model` | NVIDIA NIM model to use (default: `$NIMBUS_MODEL` or `meta/llama-3.3-70b-instruct`) |
+| `--model` | NVIDIA NIM model to use (default: `$NIMBUS_MODEL` or `deepseek-ai/deepseek-v4-flash`) |
 | `--base-url` | Override the API base URL (`$NIMBUS_BASE_URL` or NVIDIA) |
 | `--api-key` | Pass the key directly (prefer `.env`) |
 | `-p "..."` | Run a single request non-interactively, then exit |
@@ -176,16 +176,16 @@ Use `/mcp` to see connected servers and the tools they contribute.
 
 ## Models
 
-The default is `meta/llama-3.3-70b-instruct`. Any NVIDIA NIM model that
+The default is `deepseek-ai/deepseek-v4-flash`. Any NVIDIA NIM model that
 supports function calling works. Set a persistent default with `NIMBUS_MODEL`
 in your `.env` or environment, or switch live with `/model`.
 
 Good options on NIM:
+- `deepseek-ai/deepseek-v4-flash` — default, fast coding & agents, 1M context
 - `qwen/qwen3.5-122b-a10b` — 122B (10B active), tool calling, coding
-- `deepseek-ai/deepseek-v4-flash` — fast coding & agents, 1M context
+- `openai/gpt-oss-120b` — reasoning, coding (strong for code analysis)
 - `nvidia/nemotron-3-super-120b-a12b` — agentic, tool calling
 - `openai/gpt-oss-20b` — efficient reasoning MoE
-- `meta/llama-3.3-70b-instruct` — default, reliable tool calling
 
 nimbus handles both the **native OpenAI `tool_calls`** format (Llama) and
 the **XML/Hermes text format** that Qwen and other models emit — so both
@@ -205,6 +205,18 @@ The agent has 11 built-in tools: `list_directory`, `find_files`, `read_file`,
 `web_fetch`, `web_search`, `remember` — plus any tools contributed by connected
 MCP servers.
 
+## Tests
+
+A stdlib `unittest` suite covers the pure helpers and the Agent's file-editing
+and safety logic (path-escape refusal, permission rules, plan-mode read-only,
+whitespace-tolerant edits, undo, the repetition guard, and tool-call parsing):
+
+```bash
+.venu/bin/python -m unittest discover -s tests -v
+```
+
+These run fully offline — no API key or network needed.
+
 ## Requirements
 
 - Python 3.8+
@@ -214,4 +226,4 @@ MCP servers.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
