@@ -2,7 +2,11 @@
 # Launcher for nimbus. Prefers this repo's .venu (which has the openai SDK),
 # falls back to system python3. Pass any args/flags straight through.
 set -euo pipefail
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+    SCRIPT="$(readlink -f "$SCRIPT" 2>/dev/null || readlink "$SCRIPT" 2>/dev/null || echo "$SCRIPT")"
+fi
+DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
 if [ -x "$DIR/.venu/bin/python" ]; then
   PY="$DIR/.venu/bin/python"
 else

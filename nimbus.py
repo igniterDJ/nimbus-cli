@@ -2144,6 +2144,44 @@ def _handle_command(agent: Agent, line: str) -> bool:
     return False
 
 
+def _install_nimbus() -> None:
+    """Create a symlink at ~/.local/bin/nimbus pointing to this repo's launcher."""
+    bin_dir = Path.home() / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    launcher = Path(__file__).resolve().parent / "nimbus"
+    target = bin_dir / "nimbus"
+    if target.exists() or target.is_symlink():
+        target.unlink()
+    target.symlink_to(launcher)
+    launcher.chmod(launcher.stat().st_mode | 0o111)
+    print(f"Installed symlink: {target} -> {launcher}")
+    path_env = os.environ.get("PATH", "")
+    if str(bin_dir) not in path_env.split(os.pathsep):
+        print(f"\n⚠️  Warning: {bin_dir} is not on your PATH.")
+        shell = os.environ.get("SHELL", "/bin/bash")
+        rc_file = ".bashrc"
+        if "zsh" in shell:
+            rc_file = ".zshrc"
+        elif "bash" in shell:
+            rc_file = ".bashrc"
+        print(f"   Add this line to your ~/{rc_file} (or equivalent shell config):")
+        print(f"   export PATH=\"$HOME/.local/bin:$PATH\"")
+        print(f"   Then run: source ~/{rc_file}")
+    else:
+        print(f"\n✅ {bin_dir} is already on your PATH.")
+    print("\nYou can now run 'nimbus' from any project directory.")
+
+
+def _uninstall_nimbus() -> None:
+    """Remove the ~/.local/bin/nimbus symlink."""
+    target = Path.home() / ".local" / "bin" / "nimbus"
+    if target.exists() or target.is_symlink():
+        target.unlink()
+        print(f"Removed {target}")
+    else:
+        print(f"No symlink found at {target}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         prog="nimbus",
@@ -2165,7 +2203,18 @@ def main() -> None:
                     help="resume a session by ID, or most recent for this folder")
     ap.add_argument("--continue", dest="resume_latest", action="store_true",
                     help="resume most recent session for this folder (alias for --resume)")
+    ap.add_argument("--install", action="store_true",
+                    help="install nimbus as a global command (symlink to ~/.local/bin)")
+    ap.add_argument("--uninstall", action="store_true",
+                    help="remove the global nimbus command")
     args = ap.parse_args()
+
+    if args.install:
+        _install_nimbus()
+        return
+    if args.uninstall:
+        _uninstall_nimbus()
+        return
 
     root = Path(args.folder).expanduser().resolve()
     if not root.is_dir():

@@ -5,7 +5,7 @@ Point it at a folder, describe a change in plain English, and it reads and edits
 your real files on disk — across multiple files, with diffs and undo.
 
 ```
-./nimbus ~/your/project
+nimbus
 nimbus› add a --json flag to proxy.py and update the README
 ```
 
@@ -37,9 +37,23 @@ Full model list is there too — click any model and copy its API name.
 > machine and is not uploaded to git. To share config without secrets, commit an
 > `.env.example` instead.
 
-**3. Run it**
+**3. Install globally (optional)**
+
 ```bash
+./nimbus --install
+```
+
+This symlinks the launcher to `~/.local/bin/nimbus`. If `~/.local/bin` is not on your PATH, the command will warn you and print the exact `export PATH` line to add to your shell config.
+
+**4. Run it**
+
+```bash
+# From the repo directory (before or without global install)
 ./nimbus ~/your/project
+
+# From any project directory (after global install)
+cd ~/your/project
+nimbus
 ```
 
 That's it. The key and model are picked up from `.env` automatically on every run — no `export` needed.
@@ -66,7 +80,7 @@ That's it. The key and model are picked up from `.env` automatically on every ru
 ## Usage
 
 ```bash
-./nimbus [folder] [--auto] [--plan] [--model MODEL] [-p "one-shot prompt"] [--resume [ID]] [--continue]
+nimbus [folder] [--auto] [--plan] [--model MODEL] [-p "one-shot prompt"] [--resume [ID]] [--continue]
 ```
 
 | Flag | Description |
@@ -80,6 +94,8 @@ That's it. The key and model are picked up from `.env` automatically on every ru
 | `-p "..."` | Run a single request non-interactively, then exit |
 | `--resume [ID]` | Resume a session by ID, or the most recent for this folder |
 | `--continue` | Resume the most recent session for this folder |
+| `--install` | Install `nimbus` as a global command (symlink to `~/.local/bin`) |
+| `--uninstall` | Remove the global `nimbus` command |
 
 ## In-session commands
 
@@ -117,9 +133,9 @@ That's it. The key and model are picked up from `.env` automatically on every ru
 Every turn is saved to `~/.nimbus/sessions/` automatically. Pick up where you left off:
 
 ```bash
-./nimbus ~/your/project --continue      # most recent session for this folder
-./nimbus ~/your/project --resume         # same as --continue
-./nimbus ~/your/project --resume <id>    # a specific session by ID
+nimbus ~/your/project --continue      # most recent session for this folder
+nimbus ~/your/project --resume         # same as --continue
+nimbus ~/your/project --resume <id>    # a specific session by ID
 ```
 
 Inside the REPL, `/sessions` lists them and `/resume <id>` loads one.
