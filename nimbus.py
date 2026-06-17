@@ -583,6 +583,7 @@ class Agent:
         self._repo_map: str | None = None
         self._read_cache: dict[str, tuple[str, bool]] = {}  # path -> (raw_text, byte_truncated)
         self._turn_reads: dict[str, int] = {}  # path -> read count this turn (reset each turn)
+        self._streamed_content = False  # set by _stream(); never left undefined
         self.messages: list[dict] = [{"role": "system", "content": self._system_prompt()}]
         self.usage: dict[str, int] = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
         self.context_tokens: int = 0
@@ -725,13 +726,23 @@ class Agent:
         self.context_tokens = total
         return total
 
-    def _print_turn_usage(self, turn_usage) -> None:
-        """Print dim token line after a turn completes."""
-        pt = getattr(turn_usage, "prompt_tokens", 0) or 0
-        ct = getattr(turn_usage, "completion_tokens", 0) or 0
-        if pt == 0 and ct == 0:
-            # Estimate if model returned no usage
-            ct = self.usage["completion"]  # already accumulated
+    def _turn_token_delta(self, prev_prompt: int, prev_completion: int,
+                          final_content: str = "") -> tuple[int, int]:
+        """Per-turn (prompt, completion) tokens = session totals minus the snapshot
+        taken at turn start. A turn can span several streamed calls, so the delta
+        captures the whole turn — not just the last call. If the model reported no
+        usage at all this turn (delta is 0), estimate the completion from the final
+        response length (~4 chars/token) so the line isn't misleadingly empty."""
+        pt = max(0, self.usage["prompt"] - prev_prompt)
+        ct = max(0, self.usage["completion"] - prev_completion)
+        if pt == 0 and ct == 0 and final_content.strip():
+            ct = max(1, len(final_content) // 4)
+        return pt, ct
+
+    def _print_turn_usage(self, prev_prompt: int, prev_completion: int,
+                          final_content: str = "") -> tuple[int, int]:
+        """Print dim token line after a turn completes. Returns (pt, ct)."""
+        pt, ct = self._turn_token_delta(prev_prompt, prev_completion, final_content)
         st = self.usage["total"]
         line = f"{DIM}↑{pt} ↓{ct} tok · turn │ {st} session"
         price_in = os.environ.get("NIMBUS_PRICE_IN")
@@ -745,6 +756,7 @@ class Agent:
                 pass
         line += RESET
         print(line)
+        return pt, ct
 
     # ---- path safety
     def _resolve(self, path: str) -> Path:
@@ -1016,7 +1028,7 @@ class Agent:
         block = self._permitted('write', self._rel(p) or path)
         if block:
             return block
-        if p.suffix.lower() in (".md", ".rst") and not self._confirm(
+        if p.suffix.lower() in (".md", ".rst") and p.name != "NIMBUS.md" and not self._confirm(
                 f"Edit documentation file: {self._rel(p)} — are you sure? "
                 "Spec/README files should generally not be edited when implementing features; "
                 "the implementation goes in .py files."):
@@ -1265,7 +1277,11 @@ class Agent:
                     ["rg", "-n", "--no-heading", "-S", pattern, str(base)],
                     capture_output=True, text=True, timeout=60,
                 )
-                return (proc.stdout or "(no matches)")[:MAX_CMD_OUTPUT]
+                # rg: 0 = matches, 1 = no matches, 2 = error. Only trust 0/1;
+                # on a real error fall through to the Python regex engine below
+                # rather than silently reporting "(no matches)".
+                if proc.returncode in (0, 1):
+                    return (proc.stdout or "(no matches)")[:MAX_CMD_OUTPUT]
             except Exception:
                 pass
         try:
@@ -1340,6 +1356,27 @@ class Agent:
             print(f"{DIM}· {name} {a}{RESET}")
 
     # ---- context-window management (summary-based compaction)
+    @staticmethod
+    def _render_history_for_summary(old_msgs: list[dict]) -> str:
+        """Flatten messages into text for the compaction summarizer. Includes
+        native tool_calls — for assistant messages the prose `content` is often
+        empty while the real action lives in `tool_calls`; omitting it gives the
+        summarizer no idea what was done. None content is tolerated."""
+        parts = []
+        for m in old_msgs:
+            role = m.get("role", "?")
+            body = str(m.get("content") or "")[:2000]
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                names = ", ".join(
+                    f"{tc.get('function', {}).get('name', '?')}("
+                    f"{str(tc.get('function', {}).get('arguments', ''))[:200]})"
+                    for tc in tcs
+                )
+                body = (body + f"\n[called tools: {names}]").strip()
+            parts.append(f"[{role}] {body}")
+        return "\n\n".join(parts)[:12000]
+
     def _compact_history(self, force: bool = False) -> None:
         """Compact older conversation rounds into a summary when context is large.
 
@@ -1356,7 +1393,7 @@ class Agent:
         current_round: list[int] = []
 
         for i, m in enumerate(self.messages):
-            if m.get("role") == "user" and m.get("content", "").startswith(
+            if m.get("role") == "user" and (m.get("content") or "").startswith(
                     "Tool results (continue, or give your final summary):"):
                 # This is a synthetic user message from text-format tool results;
                 # it belongs to the current round, not a new one.
@@ -1398,11 +1435,9 @@ class Agent:
         if not old_indices:
             return
 
-        # Build the text to summarize
+        # Build the text to summarize.
         old_msgs = [self.messages[i] for i in old_indices]
-        summary_text = "\n\n".join(
-            f"[{m.get('role','?')}] {str(m.get('content',''))[:2000]}" for m in old_msgs
-        )[:12000]
+        summary_text = self._render_history_for_summary(old_msgs)
 
         summary_prompt = (
             "Summarize this conversation for continuity. Capture: the user's goals, "
@@ -1450,24 +1485,43 @@ class Agent:
         print(f"{DIM}· compacted {n_removed} older messages into a summary{RESET}")
 
     # ---- model rotation (rate-limit fallback)
-    def _rotate_model(self) -> bool:
-        """Switch to the next model in NIMBUS_MODEL_POOL. Returns True if rotated."""
+    def _next_in_pool(self) -> str | None:
+        """Return the next model after the current one in NIMBUS_MODEL_POOL
+        (wrapping around), or None if no usable pool is configured."""
         pool_str = os.environ.get("NIMBUS_MODEL_POOL", "")
         if not pool_str:
-            return False
+            return None
         pool = [m.strip() for m in pool_str.split(",") if m.strip()]
         if len(pool) < 2:
-            return False
+            return None
         try:
             idx = pool.index(self.model)
         except ValueError:
             idx = -1
         next_model = pool[(idx + 1) % len(pool)]
-        if next_model == self.model:
+        return next_model if next_model != self.model else None
+
+    def _rotate_model(self) -> bool:
+        """Switch to the next model in NIMBUS_MODEL_POOL. Returns True if rotated."""
+        next_model = self._next_in_pool()
+        if not next_model:
             return False
         old = self.model
         self.model = next_model
         warn(f"(rate-limited on {old} — switching to {self.model})")
+        return True
+
+    def switch_to_next_model(self) -> bool:
+        """Manually advance to the next model in the pool (the /nextmodel command).
+        Returns True if switched. Mirrors /model: refreshes the system prompt so the
+        model sees its own correct name."""
+        next_model = self._next_in_pool()
+        if not next_model:
+            return False
+        old = self.model
+        self.model = next_model
+        self.messages[0] = {"role": "system", "content": self._system_prompt()}
+        info(f"switched model: {old} → {self.model}")
         return True
 
     # ---- API call with retry/backoff → streaming
@@ -1482,6 +1536,7 @@ class Agent:
             tool_choice="auto", temperature=0.2, max_tokens=MAX_TOKENS,
             stream=True, stream_options={"include_usage": True},
         )
+        stream = None  # defensive: the loop below either sets this or raises
         for attempt in range(len(RETRY_DELAYS) + 1):
             try:
                 with Spinner():
@@ -1520,11 +1575,14 @@ class Agent:
         # Rich path: nothing is written during streaming; run_turn renders one clean
         # Markdown block after the full response arrives.
         # non-Rich / non-TTY: stream chars directly; run_turn must NOT re-render.
+        if stream is None:  # all retries exhausted without raising (should not happen)
+            raise RuntimeError("failed to create completion stream")
         content_buf = ""
         tc_accum: dict[int, dict] = {}  # index → {id, name, arguments}
         usage = None
         streamed_content = False  # did we write assistant content to stdout live?
         streamed_reasoning = False  # did we stream chain-of-thought to stdout live?
+        wrote_tc_status = False  # did we paint the "preparing tool call…" line?
 
         # In Rich TTY mode nothing is written to stdout during streaming, so the
         # spinner can run safely for the whole consumption phase. In non-Rich /
@@ -1559,6 +1617,7 @@ class Agent:
                             if _TTY:
                                 sys.stdout.write(f"\r{DIM}· preparing tool call…{RESET}\r")
                                 sys.stdout.flush()
+                                wrote_tc_status = True
                         elif not (_TTY and _RICH):
                             # non-Rich or piped: stream content as it arrives
                             sys.stdout.write(delta.content)
@@ -1609,6 +1668,12 @@ class Agent:
                         stream.close()
                     except Exception:
                         pass
+
+        # Wipe the transient "preparing tool call…" status so the next render
+        # doesn't leave stray characters from it on the line.
+        if wrote_tc_status and _TTY:
+            sys.stdout.write("\r" + " " * 28 + "\r")
+            sys.stdout.flush()
 
         if aborted_repeat:
             if streamed_content or streamed_reasoning:
@@ -1663,14 +1728,17 @@ class Agent:
             self.session_title = user_input.strip()[:60]
         self._turn_reads.clear()
         self.messages.append({"role": "user", "content": self._expand_mentions(user_input)})
-        turn_usage = None
+        # Snapshot session usage so the end-of-turn line can report this turn's
+        # delta (across all streamed calls) rather than the session total.
+        _snap_prompt = self.usage["prompt"]
+        _snap_completion = self.usage["completion"]
+        _produced = False  # did this turn yield any content or tool call at all?
         _last_sig: str | None = None
         _repeat: int = 0
         for _ in range(MAX_ITERS):
             self._compact_history()
             try:
                 content, native_calls, usage = self._stream()
-                turn_usage = usage
             except KeyboardInterrupt:
                 warn("\n(interrupted — returning to prompt)")
                 save_session(self)
@@ -1692,14 +1760,22 @@ class Agent:
                 entry["tool_calls"] = native_calls
             self.messages.append(entry)
 
+            if content.strip() or native_calls or text_calls:
+                _produced = True
+
             if not native_calls and not text_calls:
                 # Final answer — Rich renders once here; non-Rich already streamed to stdout.
                 if content.strip():
                     if _TTY and _RICH:
                         console.print(Markdown(content.strip()))
                     # else: content already on screen from streaming; don't re-print
+                elif not _produced:
+                    # The whole turn yielded nothing — no prose, no tool calls, often
+                    # no usage. Almost always a transient API/model glitch (BUG 7);
+                    # surface it so a one-shot run doesn't exit silently empty.
+                    warn("(model returned an empty response — ask me to continue or retry)")
                 # Print turn usage line
-                self._print_turn_usage(turn_usage)
+                self._print_turn_usage(_snap_prompt, _snap_completion, content)
                 save_session(self)
                 return  # turn complete
 
@@ -1813,6 +1889,7 @@ HELP = f"""{BOLD}Commands{RESET}
   /confirm         switch to CONFIRM mode (ask before every change — the default)
   /mode            show the current mode
   /model [name]    list & pick from known models (or set by name directly)
+  /nextmodel       switch to the next model in NIMBUS_MODEL_POOL (alias: /next)
   /open <path>     switch the working folder
   /pwd             show the working folder
   /files           print the file tree
@@ -1928,6 +2005,10 @@ def _handle_command(agent: Agent, line: str) -> bool:
                 agent.model = choice
                 agent.messages[0] = {"role": "system", "content": agent._system_prompt()}
                 info(f"model set to {agent.model}")
+    elif cmd in ("/nextmodel", "/next"):
+        if not agent.switch_to_next_model():
+            warn("Can't switch — set NIMBUS_MODEL_POOL with 2+ models in .env "
+                 "(the current model is the only one, or no pool is configured).")
     elif cmd == "/open":
         if not arg:
             err("usage: /open <path>")

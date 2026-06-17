@@ -30,6 +30,13 @@ EOF
 Get your API key at [build.nvidia.com](https://build.nvidia.com).
 Full model list is there too — click any model and copy its API name.
 
+> **Note:** `.env` is listed in `.gitignore` and is **never committed** — it holds
+> your secret API key. Cloning the repo does **not** give you a `.env`; you must
+> create your own as shown above. Likewise, anything you put in `.env`
+> (`NIMBUS_MODEL`, `NIMBUS_MODEL_POOL`, `NIMBUS_BASE_URL`, …) stays local to your
+> machine and is not uploaded to git. To share config without secrets, commit an
+> `.env.example` instead.
+
 **3. Run it**
 ```bash
 ./nimbus ~/your/project
@@ -85,6 +92,7 @@ That's it. The key and model are picked up from `.env` automatically on every ru
 | `/plan` | Enter plan mode (read-only investigation) |
 | `/build` | Leave plan mode and execute |
 | `/model [name]` | Show or change the model (interactive picker with no arg) |
+| `/nextmodel` | Switch to the next model in `NIMBUS_MODEL_POOL` (alias: `/next`) |
 | `/open <path>` | Switch the working folder |
 | `/pwd` | Show working folder |
 | `/files` | Print the file tree |
@@ -179,6 +187,17 @@ Use `/mcp` to see connected servers and the tools they contribute.
 The default is `deepseek-ai/deepseek-v4-flash`. Any NVIDIA NIM model that
 supports function calling works. Set a persistent default with `NIMBUS_MODEL`
 in your `.env` or environment, or switch live with `/model`.
+
+**Model pool & rotation.** Set `NIMBUS_MODEL_POOL` in `.env` to a comma-separated
+list of model IDs. nimbus walks the pool automatically when a model is
+rate-limited or degraded, and you can step to the next one yourself at any time
+with `/nextmodel` (alias `/next`) — handy for quickly comparing models or
+escaping a slow one. Order the list best/fastest first; rotation wraps around.
+
+```bash
+NIMBUS_MODEL=moonshotai/kimi-k2.6
+NIMBUS_MODEL_POOL=moonshotai/kimi-k2.6,deepseek-ai/deepseek-v4-flash,qwen/qwen3.5-122b-a10b
+```
 
 Good options on NIM:
 - `deepseek-ai/deepseek-v4-flash` — default, fast coding & agents, 1M context

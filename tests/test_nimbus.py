@@ -281,5 +281,66 @@ class AgentToolTests(unittest.TestCase):
         self.assertNotIn("b.txt", out)
 
 
+    # ---- per-turn token accounting (regression: BUG 3)
+    def test_turn_delta_uses_session_increment(self):
+        # Simulate one streamed call that reported usage.
+        self.agent.usage = {"prompt": 0, "completion": 0, "total": 0, "requests": 0}
+        snap_p, snap_c = self.agent.usage["prompt"], self.agent.usage["completion"]
+        self.agent.usage["prompt"] += 1200
+        self.agent.usage["completion"] += 340
+        pt, ct = self.agent._turn_token_delta(snap_p, snap_c, "the answer")
+        self.assertEqual((pt, ct), (1200, 340))
+
+    def test_turn_delta_estimates_when_no_usage(self):
+        # Model reported no usage at all -> delta is 0; estimate from content len.
+        self.agent.usage = {"prompt": 5000, "completion": 800, "total": 5800, "requests": 3}
+        snap_p, snap_c = 5000, 800  # nothing accumulated this turn
+        content = "x" * 400
+        pt, ct = self.agent._turn_token_delta(snap_p, snap_c, content)
+        self.assertEqual(pt, 0)
+        self.assertEqual(ct, 100)  # 400 chars // 4 — NOT the 800 session total
+
+    def test_turn_delta_zero_when_empty(self):
+        self.agent.usage = {"prompt": 10, "completion": 10, "total": 20, "requests": 1}
+        self.assertEqual(self.agent._turn_token_delta(10, 10, "   "), (0, 0))
+
+    # ---- compaction summary (regression: BUG 4 + None-content safety)
+    def test_summary_includes_tool_calls(self):
+        msgs = [
+            {"role": "user", "content": "add a flag"},
+            {"role": "assistant", "content": None,  # native tool call, empty prose
+             "tool_calls": [{"function": {"name": "write_file",
+                                          "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "OK: wrote a.py"},
+        ]
+        text = nimbus.Agent._render_history_for_summary(msgs)
+        self.assertIn("write_file", text)       # the action is captured
+        self.assertIn("a.py", text)
+        self.assertIn("add a flag", text)
+
+    def test_summary_tolerates_none_content(self):
+        # Must not raise AttributeError on None content (compaction runs outside
+        # run_turn's try/except, so a crash here would take down the program).
+        msgs = [{"role": "assistant", "content": None}]
+        self.assertIsInstance(nimbus.Agent._render_history_for_summary(msgs), str)
+
+    # ---- documentation-edit guard (regression: BUG 6)
+    def test_md_guard_skips_nimbus_md(self):
+        calls = []
+        self.agent._confirm = lambda summary, diff=None: (calls.append(summary), True)[1]
+        (self.root / "NIMBUS.md").write_text("a = 1\n")
+        res = self.agent._tool_replace_in_file("NIMBUS.md", "a = 1", "a = 2")
+        self.assertTrue(res.startswith("OK"))
+        # No "documentation file" warning prompt for NIMBUS.md.
+        self.assertFalse(any("documentation file" in c for c in calls))
+
+    def test_md_guard_warns_on_readme(self):
+        calls = []
+        self.agent._confirm = lambda summary, diff=None: (calls.append(summary), True)[1]
+        (self.root / "README.md").write_text("a = 1\n")
+        self.agent._tool_replace_in_file("README.md", "a = 1", "a = 2")
+        self.assertTrue(any("documentation file" in c for c in calls))
+
+
 if __name__ == "__main__":
     unittest.main()
