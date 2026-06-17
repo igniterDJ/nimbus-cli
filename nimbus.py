@@ -74,13 +74,12 @@ if _RICH:
     console = Console()
 
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
-DEFAULT_MODEL = "meta/llama-3.3-70b-instruct"  # current, widely available, tool-calling
+DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"  # fast coding & agents, 1M ctx, strong reasoning
 
 # NVIDIA NIM models with tool/function-calling support — shown in /model picker
 KNOWN_MODELS = [
     ("nvidia/nemotron-3-nano-30b-a3b",          "Nemotron Nano 30B (3B active) — fastest, tool calling"),
-    ("meta/llama-3.3-70b-instruct",             "Llama 3.3 70B — default, reliable tool calling"),
-    ("deepseek-ai/deepseek-v4-flash",           "DeepSeek V4 Flash — fast coding & agents, 1M ctx"),
+    ("deepseek-ai/deepseek-v4-flash",           "DeepSeek V4 Flash — default, fast coding & agents, 1M ctx"),
     ("nvidia/nemotron-3-super-120b-a12b",       "Nemotron Super 120B (12B active) — agentic, tool calling"),
     ("openai/gpt-oss-20b",                      "GPT-OSS 20B MoE — efficient reasoning"),
     ("qwen/qwen3-next-80b-a3b-instruct",        "Qwen3-Next 80B (3B active) — ultra-fast, long context"),
@@ -336,6 +335,100 @@ class Spinner:
             sys.stdout.flush()
 
 
+class _NullSpinner:
+    """No-op spinner used when the streamed text itself is the progress indicator."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        pass
+
+
+# --------------------------------------------------------------- repetition guard
+def _looks_degenerate(tail: str) -> bool:
+    """Detect a model stuck repeating itself, so streaming can be cut short before
+    it burns the whole token budget on garbage. Looks at the *end* of the buffer
+    only (cheap, called periodically). Catches two shapes:
+      1. the same non-empty line emitted many times in a row, and
+      2. a short substring tiled back-to-back with no newlines.
+    """
+    # 1) identical lines repeated
+    lines = [ln for ln in tail.splitlines() if ln.strip()]
+    if len(lines) >= 10 and len(set(lines[-10:])) == 1:
+        return True
+    # 2) a short unit string tiled at the very end (e.g. "abcabcabc…")
+    s = tail[-240:]
+    n = len(s)
+    for unit in range(3, 80):
+        if n < unit * 8:
+            break
+        seg = s[-unit:]
+        if seg.strip() and seg * (n // unit) == s[-(unit * (n // unit)):]:
+            return True
+    return False
+
+
+# --------------------------------------------------------------- whitespace-tolerant edit
+def _ws_flexible_spans(text: str, old_string: str) -> list[tuple[int, int]]:
+    """Locate `old_string` in `text` ignoring ALL whitespace differences — the
+    usual cause of a failed exact `replace_in_file` (a model mis-guessing
+    indentation or spacing around operators, e.g. `None = None` vs `None=None`).
+
+    Compares both sides with every whitespace char removed, then maps matches
+    back to real character spans in `text`. Each returned span is expanded to
+    swallow the line's leading indentation and trailing inline whitespace so the
+    caller's `new_string` (which carries its own indentation) drops in cleanly.
+    Returns [] when the stripped needle is too short to match safely.
+    """
+    stripped_old = re.sub(r"\s+", "", old_string)
+    if len(stripped_old) < 8:
+        return []  # too little signal — refuse to guess
+    # Build stripped haystack with a map back to original indices.
+    stripped_chars = []
+    idx_map = []
+    for i, ch in enumerate(text):
+        if not ch.isspace():
+            stripped_chars.append(ch)
+            idx_map.append(i)
+    stripped_text = "".join(stripped_chars)
+
+    spans: list[tuple[int, int]] = []
+    search_from = 0
+    while True:
+        hit = stripped_text.find(stripped_old, search_from)
+        if hit == -1:
+            break
+        start = idx_map[hit]
+        end = idx_map[hit + len(stripped_old) - 1] + 1
+        # widen to include this line's leading indentation + trailing inline ws
+        while start > 0 and text[start - 1] in " \t":
+            start -= 1
+        while end < len(text) and text[end] in " \t":
+            end += 1
+        spans.append((start, end))
+        search_from = hit + len(stripped_old)
+    return spans
+
+
+def _ddg_clean_url(href: str) -> str:
+    """DuckDuckGo's HTML results wrap every target in a redirect link like
+    `//duckduckgo.com/l/?uddg=<percent-encoded-url>&rut=…`. Hand that raw href
+    to a model and it wastes effort trying to decode it (and often mangles the
+    result). Pull the real URL out of the `uddg` param instead.
+    """
+    if "uddg=" not in href:
+        return href
+    try:
+        query = urllib.parse.urlparse(href).query
+        target = urllib.parse.parse_qs(query).get("uddg", [])
+        if target:
+            return target[0]
+    except Exception:
+        pass
+    return href
+
+
 # --------------------------------------------------------------- text-format tool calls
 _TC_BLOCK = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 _FN_BLOCK = re.compile(r"<function=.*?</function>", re.DOTALL)
@@ -530,12 +623,24 @@ class Agent:
             "style. Do not reformat unrelated code.\n"
             "- Work step by step: explore, read what you need, edit, then if useful run a command "
             "to verify (build/lint/tests).\n"
-            "- ANSWERING QUESTIONS about the code (e.g. 'is X implemented?', 'what does Y do?'): "
-            "FIRST consult the 'Repo map (symbols)' and project layout already provided above — they "
-            "list the functions and classes that exist. Confirm with at most a few targeted searches, "
-            "then give a clear final answer. Do NOT keep re-searching to re-verify facts you already "
-            "established, and do NOT issue one tiny search per step — batch your investigation, then "
-            "STOP and answer. Once you have enough evidence, reply with your conclusion and no tool calls.\n"
+            "- ANSWERING QUESTIONS about the code. There are two kinds, and they need different effort:\n"
+            "  (a) LOCATION / EXISTENCE ('where is X?', 'what does Y do?', 'does a function named Z exist?'): "
+            "the 'Repo map (symbols)' above already lists functions and classes — consult it plus a few "
+            "targeted searches, then answer. Do not loop re-verifying what you already established.\n"
+            "  (b) VERIFICATION / JUDGEMENT ('is X implemented PROPERLY/correctly?', 'are the prompts done "
+            "right?', 'are there any bugs?', 'does this handle case Y?'): you CANNOT answer these from the "
+            "repo map or a keyword search alone. You MUST read the actual implementation code with read_file "
+            "and reason about what it does. A symbol existing in the repo map does NOT mean it is implemented "
+            "correctly or completely.\n"
+            "- CRITICAL — spec files vs. code: searching a spec/requirements file (e.g. upgradeprompt.md) only "
+            "tells you what was REQUESTED, never what was BUILT. To judge whether a feature from a spec is "
+            "implemented, you must open the CODE file (nimbus.py) and find the functions/logic that implement "
+            "it, then compare against the spec. Never conclude 'implemented' just because the spec mentions it.\n"
+            "- 'Are there bugs?' is NOT a search for the strings TODO/FIXME/BUG. Read the relevant code paths "
+            "and reason about edge cases, error handling, and correctness. Report what you actually inspected.\n"
+            "- Do not fabricate confidence. If you have not read the code that answers the question, say what "
+            "you still need to check rather than asserting a conclusion. Once you HAVE read enough, give a "
+            "clear final answer with no tool calls — don't loop one tiny search per step.\n"
             "- Paths are relative to the project root unless absolute.\n"
             "- When done, give a brief plain-text summary of what you changed and why. Do not "
             "dump entire files back to the user.\n"
@@ -921,37 +1026,55 @@ class Agent:
             return f"ERROR: file not found: {path}"
         text = p.read_text(errors="replace")
         count = text.count(old_string)
+        ws_note = ""
         if count == 0:
-            # Help the model self-correct without re-reading: find first line of old_string in file
-            first_line = old_string.strip().splitlines()[0].strip() if old_string.strip() else ""
-            hint = ""
-            if first_line:
-                lines = text.splitlines()
-                matches = [i + 1 for i, ln in enumerate(lines) if first_line in ln]
-                if matches:
-                    ctx_lines = []
-                    for ln_no in matches[:2]:
-                        start = max(0, ln_no - 3)
-                        end = min(len(lines), ln_no + 3)
-                        ctx_lines.append(f"[Line {ln_no} context:]")
-                        ctx_lines.extend(f"{start + i + 1}\t{lines[start + i]}"
-                                         for i in range(end - start))
-                    hint = ("\nFirst line of your old_string was found at: " +
-                            ", ".join(str(n) for n in matches[:2]) +
-                            "\n" + "\n".join(ctx_lines) +
-                            "\nCompare carefully — whitespace/indentation may differ.")
-                else:
-                    hint = f"\nFirst line of your old_string ({first_line!r}) was not found anywhere in the file."
-            return (f"ERROR: old_string not found in {path}.{hint}\n"
-                    "Use read_file with offset/limit to get the exact current text, then retry.")
-        if count > 1 and not replace_all:
+            # Exact match failed. Before giving up, try a whitespace-tolerant
+            # match — by far the most common cause is the model mis-guessing
+            # indentation or spacing. Only apply if it resolves unambiguously.
+            spans = _ws_flexible_spans(text, old_string)
+            if spans and (replace_all or len(spans) == 1):
+                use = spans if replace_all else spans[:1]
+                new_text = text
+                for start, end in reversed(use):  # right-to-left keeps offsets valid
+                    new_text = new_text[:start] + new_string + new_text[end:]
+                count = len(use)
+                ws_note = " (matched ignoring whitespace differences)"
+            else:
+                # Help the model self-correct: find first line of old_string in file
+                first_line = old_string.strip().splitlines()[0].strip() if old_string.strip() else ""
+                hint = ""
+                if len(spans) > 1:
+                    hint = (f"\nA whitespace-insensitive match found {len(spans)} candidates; "
+                            "it must be unique. Add more surrounding context, or set replace_all=true.")
+                elif first_line:
+                    lines = text.splitlines()
+                    matches = [i + 1 for i, ln in enumerate(lines) if first_line in ln]
+                    if matches:
+                        ctx_lines = []
+                        for ln_no in matches[:2]:
+                            start = max(0, ln_no - 3)
+                            end = min(len(lines), ln_no + 3)
+                            ctx_lines.append(f"[Line {ln_no} context:]")
+                            ctx_lines.extend(f"{start + i + 1}\t{lines[start + i]}"
+                                             for i in range(end - start))
+                        hint = ("\nFirst line of your old_string was found at: " +
+                                ", ".join(str(n) for n in matches[:2]) +
+                                "\n" + "\n".join(ctx_lines) +
+                                "\nCompare carefully — whitespace/indentation may differ.")
+                    else:
+                        hint = f"\nFirst line of your old_string ({first_line!r}) was not found anywhere in the file."
+                return (f"ERROR: old_string not found in {path}.{hint}\n"
+                        "Use read_file with offset/limit to get the exact current text, then retry.")
+        elif count > 1 and not replace_all:
             return (f"ERROR: old_string matches {count} times; it must be unique. Add more "
                     "surrounding context, or set replace_all=true.")
-        new_text = (text.replace(old_string, new_string) if replace_all
-                    else text.replace(old_string, new_string, 1))
+        else:
+            new_text = (text.replace(old_string, new_string) if replace_all
+                        else text.replace(old_string, new_string, 1))
+            count = count if replace_all else 1
         diff = self._diff(text, new_text, self._rel(p))
-        n = count if replace_all else 1
-        if not self._confirm(f"Edit file: {self._rel(p)} ({n} replacement{'s' if n > 1 else ''})", diff):
+        n = count
+        if not self._confirm(f"Edit file: {self._rel(p)} ({n} replacement{'s' if n > 1 else ''}){ws_note}", diff):
             return "SKIPPED: user declined the edit."
         try:
             self._backup(p)
@@ -960,8 +1083,8 @@ class Agent:
             return f"ERROR: cannot write {path}: {e}"
         self._read_cache.pop(str(p.resolve()), None)
         self._turn_reads.pop(str(p.resolve()), None)
-        info(f"  ✓ edited {self._rel(p)} ({n} replacement{'s' if n > 1 else ''})")
-        return f"OK: edited {self._rel(p)} ({n} replacement(s))."
+        info(f"  ✓ edited {self._rel(p)} ({n} replacement{'s' if n > 1 else ''}){ws_note}")
+        return f"OK: edited {self._rel(p)} ({n} replacement(s)).{ws_note}"
 
     def _tool_run_command(self, command: str) -> str:
         if self.plan:
@@ -1124,7 +1247,8 @@ class Agent:
                 p = _DDGParser()
                 p.feed(html)
                 for item in p.results[:5]:
-                    results.append(f"{item.get('title', '').strip()} — {item.get('url', '')}\n  {item.get('snippet', '').strip()[:200]}")
+                    url = _ddg_clean_url(item.get('url', ''))
+                    results.append(f"{item.get('title', '').strip()} — {url}\n  {item.get('snippet', '').strip()[:200]}")
                 if not results:
                     return 'No results found. Set TAVILY_API_KEY for reliable web search.'
         except Exception as e:
@@ -1402,58 +1526,95 @@ class Agent:
         streamed_content = False  # did we write assistant content to stdout live?
         streamed_reasoning = False  # did we stream chain-of-thought to stdout live?
 
-        try:
-            for chunk in stream:
-                # Final usage-only chunk
-                if not chunk.choices:
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage = chunk.usage
-                    continue
+        # In Rich TTY mode nothing is written to stdout during streaming, so the
+        # spinner can run safely for the whole consumption phase. In non-Rich /
+        # non-TTY mode the streamed text itself is the progress indicator — a
+        # spinner would overwrite it.
+        spinner_ctx = Spinner() if (_TTY and _RICH) else _NullSpinner()
+        # Repetition guard: some NIM models occasionally fall into a loop and
+        # repeat one line until the token cap, wasting the whole budget. Watch
+        # the tail of whatever text is streaming and bail out early if it
+        # degenerates. Checked every REPEAT_CHECK_EVERY chars (cheap, throttled).
+        repeat_tail = ""
+        chars_since_check = 0
+        REPEAT_CHECK_EVERY = 280
+        aborted_repeat = False
+        with spinner_ctx:
+            try:
+                for chunk in stream:
+                    # Final usage-only chunk
+                    if not chunk.choices:
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            usage = chunk.usage
+                        continue
 
-                delta = chunk.choices[0].delta
+                    delta = chunk.choices[0].delta
 
-                # --- content delta ---
-                if delta.content:
-                    content_buf += delta.content
+                    # --- content delta ---
+                    if delta.content:
+                        content_buf += delta.content
 
-                    if "<tool_call>" in content_buf or "<function=" in content_buf:
-                        # Suppress raw tool-call XML (text-format models)
-                        if _TTY:
-                            sys.stdout.write(f"\r{DIM}· preparing tool call…{RESET}\r")
+                        if "<tool_call>" in content_buf or "<function=" in content_buf:
+                            # Suppress raw tool-call XML (text-format models)
+                            if _TTY:
+                                sys.stdout.write(f"\r{DIM}· preparing tool call…{RESET}\r")
+                                sys.stdout.flush()
+                        elif not (_TTY and _RICH):
+                            # non-Rich or piped: stream content as it arrives
+                            sys.stdout.write(delta.content)
                             sys.stdout.flush()
-                    elif not (_TTY and _RICH):
-                        # non-Rich or piped: stream content as it arrives
-                        sys.stdout.write(delta.content)
+                            streamed_content = True
+                        # Rich TTY: stay silent; content rendered once after stream ends
+
+                    # --- tool_calls delta ---
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tc_accum:
+                                tc_accum[idx] = {"id": "", "name": "", "arguments": ""}
+                            if tc_delta.id:
+                                tc_accum[idx]["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    tc_accum[idx]["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    tc_accum[idx]["arguments"] += tc_delta.function.arguments
+
+                    # --- reasoning delta (some NIM models expose chain-of-thought) ---
+                    # gpt-oss and others may populate BOTH `reasoning_content` and
+                    # `reasoning` with the SAME text per chunk — emit only one, else
+                    # every reasoning token prints twice ("WeWe need need ...").
+                    rtext = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if rtext:
+                        sys.stdout.write(f"{DIM}{rtext}{RESET}" if _TTY else rtext)
                         sys.stdout.flush()
-                        streamed_content = True
-                    # Rich TTY: stay silent; content rendered once after stream ends
+                        streamed_reasoning = True
 
-                # --- tool_calls delta ---
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tc_accum:
-                            tc_accum[idx] = {"id": "", "name": "", "arguments": ""}
-                        if tc_delta.id:
-                            tc_accum[idx]["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                tc_accum[idx]["name"] = tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                tc_accum[idx]["arguments"] += tc_delta.function.arguments
+                    # --- repetition guard ---
+                    new_text = (delta.content or "") + (rtext or "")
+                    if new_text:
+                        repeat_tail = (repeat_tail + new_text)[-360:]
+                        chars_since_check += len(new_text)
+                        if chars_since_check >= REPEAT_CHECK_EVERY:
+                            chars_since_check = 0
+                            if _looks_degenerate(repeat_tail):
+                                aborted_repeat = True
+                                break
 
-                # --- reasoning delta (some NIM models expose chain-of-thought) ---
-                # gpt-oss and others may populate BOTH `reasoning_content` and
-                # `reasoning` with the SAME text per chunk — emit only one, else
-                # every reasoning token prints twice ("WeWe need need ...").
-                rtext = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                if rtext:
-                    sys.stdout.write(f"{DIM}{rtext}{RESET}" if _TTY else rtext)
-                    sys.stdout.flush()
-                    streamed_reasoning = True
+            except KeyboardInterrupt:
+                pass  # surface gracefully
+            finally:
+                if aborted_repeat:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
-        except KeyboardInterrupt:
-            pass  # surface gracefully
+        if aborted_repeat:
+            if streamed_content or streamed_reasoning:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            warn("(stopped early — the model began repeating itself)")
 
         # Reasoning streams without a trailing newline; add one so the next
         # tool announce / rendered answer doesn't glue onto the last thought.
