@@ -108,7 +108,9 @@ nimbus [folder] [--auto] [--plan] [--model MODEL] [-p "one-shot prompt"] [--resu
 | `/plan` | Enter plan mode (read-only investigation) |
 | `/build` | Leave plan mode and execute |
 | `/model [name]` | Show or change the model (interactive picker with no arg) |
-| `/nextmodel` | Switch to the next model in `NIMBUS_MODEL_POOL` (alias: `/next`) |
+| `/fast` `/code` `/max` | Switch model tier (small / balanced / largest) & jump to its top model |
+| `/pool` | List the model tiers and show the active one (alias: `/pools`) |
+| `/nextmodel` | Rotate to the next model within the active tier (alias: `/next`) |
 | `/open <path>` | Switch the working folder |
 | `/pwd` | Show working folder |
 | `/files` | Print the file tree |
@@ -204,11 +206,25 @@ The default is `deepseek-ai/deepseek-v4-flash`. Any NVIDIA NIM model that
 supports function calling works. Set a persistent default with `NIMBUS_MODEL`
 in your `.env` or environment, or switch live with `/model`.
 
-**Model pool & rotation.** Set `NIMBUS_MODEL_POOL` in `.env` to a comma-separated
-list of model IDs. nimbus walks the pool automatically when a model is
-rate-limited or degraded, and you can step to the next one yourself at any time
-with `/nextmodel` (alias `/next`) — handy for quickly comparing models or
-escaping a slow one. Order the list best/fastest first; rotation wraps around.
+**Model tiers & rotation.** nimbus ships with three curated model tiers baked
+into the code (`MODEL_POOLS` in `nimbus.py`), so model switching works out of the
+box on a fresh clone — no `.env` needed:
+
+| Command | Tier | For |
+| --- | --- | --- |
+| `/fast` | small / low-latency | quick edits & chat |
+| `/code` | mid-size daily drivers | balanced coding & agents (**default**) |
+| `/max`  | largest / most capable | hard reasoning & long-horizon work |
+
+`/fast`, `/code`, `/max` switch the active tier and jump to its top model. Within
+a tier, step to the next model with `/nextmodel` (alias `/next`) — handy for
+comparing models or escaping a slow one; rotation wraps around. nimbus also walks
+the active tier automatically when a model is rate-limited or degraded. Use
+`/pool` to list the tiers and see which is active. nimbus starts in `/code`.
+
+To use your own flat pool instead, set `NIMBUS_MODEL_POOL` in `.env` to a
+comma-separated list of model IDs (best/fastest first). It **overrides the tiers**
+with a single custom pool that `/nextmodel` rotates:
 
 ```bash
 NIMBUS_MODEL=moonshotai/kimi-k2.6
@@ -255,7 +271,7 @@ These run fully offline — no API key or network needed.
 ## Requirements
 
 - Python 3.8+
-- `openai >= 1.30` and `rich >= 13` (`pip install -r requirements.txt`)
+- `openai >= 1.30`, `rich >= 13`, `prompt_toolkit >= 3.0` (`pip install -r requirements.txt`)
 - Optional: `mcp >= 1.0` for MCP server support
 - An NVIDIA API key — [build.nvidia.com](https://build.nvidia.com)
 

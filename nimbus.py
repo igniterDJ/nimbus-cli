@@ -47,6 +47,15 @@ except ImportError:
     _readline = None  # Windows fallback — history still works via input() on some terminals
 
 try:
+    from prompt_toolkit import prompt as _pt_prompt
+    from prompt_toolkit.history import FileHistory as _PTFileHistory
+    from prompt_toolkit.completion import Completer as _PTCompleter, Completion as _PTCompletion
+    from prompt_toolkit.styles import Style as _PTStyle
+    _PT_AVAILABLE = True
+except ImportError:
+    _PT_AVAILABLE = False
+
+try:
     from mcp_client import McpManager as _McpManager
     _MCP_AVAILABLE = True
 except ImportError:
@@ -93,8 +102,63 @@ KNOWN_MODELS = [
     ("openai/gpt-oss-120b",                     "GPT-OSS 120B MoE — reasoning, coding"),
     ("meta/llama-3.1-8b-instruct",              "Llama 3.1 8B — smallest, fastest dense model"),
 ]
-# Set a persistent default via NIMBUS_MODEL in .env
-# For rate-limit rotation, set NIMBUS_MODEL_POOL as a comma-separated list of model IDs
+# Set a persistent default via NIMBUS_MODEL in .env.
+#
+# Model rotation walks a *pool* of models. nimbus ships three curated tiers below
+# (MODEL_POOLS); switch between them live with /fast, /code, /max (or /pool), and
+# rotate within the active tier with /nextmodel. These are baked in, so rotation
+# works out of the box on a fresh clone — no .env required.
+#
+# NIMBUS_MODEL_POOL (comma-separated model IDs) in .env still works: if set, it
+# overrides the tiers with a single custom pool (and the tier commands say so).
+MODEL_POOLS: dict[str, list[str]] = {
+    # fast — small / low-latency, for quick edits & chat
+    "fast": [
+        "nvidia/nemotron-3-nano-30b-a3b",
+        "deepseek-ai/deepseek-v4-flash",
+        "qwen/qwen3-next-80b-a3b-instruct",
+        "openai/gpt-oss-20b",
+        "stepfun-ai/step-3.5-flash",
+        "stepfun-ai/step-3.7-flash",
+        "bytedance/seed-oss-36b-instruct",
+        "meta/llama-3.3-70b-instruct",
+    ],
+    # code — mid-size daily drivers, balanced coding & agents (the default tier)
+    "code": [
+        "qwen/qwen3.5-122b-a10b",
+        "z-ai/glm-5.1",
+        "mistralai/mistral-small-4-119b-2603",
+        "mistralai/mistral-medium-3.5-128b",
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "meta/llama-4-maverick-17b-128e-instruct",
+    ],
+    # max — largest / most capable, for hard reasoning & long-horizon work
+    "max": [
+        "moonshotai/kimi-k2.6",
+        "deepseek-ai/deepseek-v4-pro",
+        "qwen/qwen3.5-397b-a17b",
+        "openai/gpt-oss-120b",
+        "nvidia/nemotron-3-super-120b-a12b",
+    ],
+}
+DEFAULT_POOL = "code"  # active tier on launch
+
+
+def pool_override() -> list[str] | None:
+    """A custom pool from NIMBUS_MODEL_POOL, or None if the tiers are in effect."""
+    pool_str = os.environ.get("NIMBUS_MODEL_POOL", "")
+    if pool_str.strip():
+        return [m.strip() for m in pool_str.split(",") if m.strip()]
+    return None
+
+
+def model_pool(name: str = DEFAULT_POOL) -> list[str]:
+    """The model rotation list for tier `name`. NIMBUS_MODEL_POOL, if set,
+    overrides all tiers with a single custom pool."""
+    override = pool_override()
+    if override is not None:
+        return override
+    return list(MODEL_POOLS.get(name, MODEL_POOLS[DEFAULT_POOL]))
 
 MAX_ITERS = 60            # tool-call rounds per user turn before we stop
 MAX_TOKENS = 8192         # completion cap (prevents truncated tool calls)
@@ -171,9 +235,10 @@ def save_session(agent) -> None:
         idx = json.loads(idx_path.read_text()) if idx_path.exists() else []
     except Exception:
         idx = []
+    turn_count = sum(1 for m in agent.messages if m.get("role") == "user")
     entry = {"id": sid, "root": str(agent.root), "title": data["title"],
              "model": agent.model, "created": data["created"],
-             "updated": now, "message_count": len(agent.messages)}
+             "updated": now, "turn_count": turn_count}
     idx = [e for e in idx if e.get("id") != sid]
     idx.insert(0, entry)
     idx_path.write_text(json.dumps(idx, indent=2))
@@ -575,6 +640,7 @@ class Agent:
     def __init__(self, root: Path, model: str, client: OpenAI, auto: bool):
         self.root = root
         self.model = model
+        self.pool = DEFAULT_POOL  # active model tier for rotation (see MODEL_POOLS)
         self.client = client
         self.auto = auto
         self.plan = False  # PLAN MODE flag — must be set BEFORE _system_prompt() is called
@@ -1486,12 +1552,9 @@ class Agent:
 
     # ---- model rotation (rate-limit fallback)
     def _next_in_pool(self) -> str | None:
-        """Return the next model after the current one in NIMBUS_MODEL_POOL
+        """Return the next model after the current one in the active tier's pool
         (wrapping around), or None if no usable pool is configured."""
-        pool_str = os.environ.get("NIMBUS_MODEL_POOL", "")
-        if not pool_str:
-            return None
-        pool = [m.strip() for m in pool_str.split(",") if m.strip()]
+        pool = model_pool(self.pool)
         if len(pool) < 2:
             return None
         try:
@@ -1502,7 +1565,7 @@ class Agent:
         return next_model if next_model != self.model else None
 
     def _rotate_model(self) -> bool:
-        """Switch to the next model in NIMBUS_MODEL_POOL. Returns True if rotated."""
+        """Switch to the next model in the active tier's pool. Returns True if rotated."""
         next_model = self._next_in_pool()
         if not next_model:
             return False
@@ -1522,6 +1585,25 @@ class Agent:
         self.model = next_model
         self.messages[0] = {"role": "system", "content": self._system_prompt()}
         info(f"switched model: {old} → {self.model}")
+        return True
+
+    def switch_pool(self, name: str) -> bool:
+        """Switch the active model tier (/fast, /code, /max) and jump to its top
+        model. Returns False if `name` is not a known tier. Mirrors /model so the
+        model sees its own correct name."""
+        if name not in MODEL_POOLS:
+            return False
+        self.pool = name
+        # model_pool() honours a NIMBUS_MODEL_POOL override; use the tier's head
+        # only when no override is active, so the env pool stays authoritative.
+        target = MODEL_POOLS[name][0] if pool_override() is None else self.model
+        if target != self.model:
+            old = self.model
+            self.model = target
+            self.messages[0] = {"role": "system", "content": self._system_prompt()}
+            info(f"pool: {name} — model {old} → {self.model}")
+        else:
+            info(f"pool: {name} — model {self.model}")
         return True
 
     # ---- API call with retry/backoff → streaming
@@ -1889,7 +1971,9 @@ HELP = f"""{BOLD}Commands{RESET}
   /confirm         switch to CONFIRM mode (ask before every change — the default)
   /mode            show the current mode
   /model [name]    list & pick from known models (or set by name directly)
-  /nextmodel       switch to the next model in NIMBUS_MODEL_POOL (alias: /next)
+  /fast /code /max switch model tier (small/balanced/largest) & jump to its top model
+  /pool            list the model tiers and show the active one (alias: /pools)
+  /nextmodel       rotate to the next model within the active tier (alias: /next)
   /open <path>     switch the working folder
   /pwd             show the working folder
   /files           print the file tree
@@ -1924,17 +2008,99 @@ Use {BOLD}@path/to/file{RESET} in a request to attach that file's contents.
 Anything else is a request — e.g. "add a --json flag to proxy.py and update the README"."""
 
 
+# Slash-command registry for autocomplete: (command, description)
+_SLASH_COMMANDS = [
+    ("/help",        "show this help"),
+    ("/auto",        "autonomous mode — apply edits without asking"),
+    ("/confirm",     "confirm mode — ask before every change"),
+    ("/mode",        "show current mode (auto / confirm)"),
+    ("/model",       "list & pick models, or /model <name> to set directly"),
+    ("/fast",        "switch to fast tier (small / low-latency models)"),
+    ("/code",        "switch to code tier — balanced daily driver (default)"),
+    ("/max",         "switch to max tier (largest / most capable models)"),
+    ("/pool",        "list model tiers and show the active one"),
+    ("/nextmodel",   "rotate to the next model in the active tier"),
+    ("/next",        "alias for /nextmodel"),
+    ("/open",        "/open <path>  — switch working folder"),
+    ("/pwd",         "show the current working folder"),
+    ("/files",       "print the file tree"),
+    ("/map",         "print the repo symbol map  (--refresh to recompute)"),
+    ("/diff",        "show every file change nimbus made this session"),
+    ("/undo",        "revert all file changes nimbus made this session"),
+    ("/clear",       "clear conversation history (keeps folder & settings)"),
+    ("/compact",     "force history compaction — summarise older turns"),
+    ("/cost",        "show token usage for this session"),
+    ("/tokens",      "alias for /cost"),
+    ("/sessions",    "list saved sessions for this folder"),
+    ("/resume",      "/resume <id>  — restore a saved session by ID"),
+    ("/new",         "start a fresh session"),
+    ("/memory",      "print project memory (NIMBUS.md)"),
+    ("/plan",        "enter PLAN mode — read-only investigation"),
+    ("/build",       "exit plan mode and execute the plan"),
+    ("/permissions", "show effective allow / deny rules"),
+    ("/allow",       "/allow <pattern>  — add an allow_commands rule"),
+    ("/deny",        "/deny <pattern>   — add a deny_commands rule"),
+    ("/mcp",         "list connected MCP servers and their tools"),
+    ("/exit",        "leave nimbus"),
+    ("/quit",        "alias for /exit"),
+]
+
+if _PT_AVAILABLE:
+    class _SlashCompleter(_PTCompleter):
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # Only complete when the whole line so far starts with /
+            if not text.lstrip().startswith("/"):
+                return
+            word = text.lstrip()
+            for cmd, desc in _SLASH_COMMANDS:
+                if cmd.startswith(word):
+                    yield _PTCompletion(
+                        cmd,
+                        start_position=-len(word),
+                        display=cmd,
+                        display_meta=desc,
+                    )
+
+    _PT_STYLE = _PTStyle.from_dict({
+        "completion-menu.completion":         "bg:#1e1e2e fg:#cdd6f4",
+        "completion-menu.completion.current": "bg:#313244 fg:#cba6f7 bold",
+        "completion-menu.meta.completion":         "bg:#1e1e2e fg:#6c7086",
+        "completion-menu.meta.completion.current": "bg:#313244 fg:#a6adc8",
+    })
+
+
 def repl(agent: Agent) -> None:
-    # Load/save persistent readline history so up/down arrows recall previous sessions.
     _hist = Path.home() / ".nimbus_history"
-    if _readline:
-        try:
-            _readline.read_history_file(_hist)
-        except FileNotFoundError:
-            pass
-        _readline.set_history_length(500)
-        import atexit
-        atexit.register(lambda: _readline.write_history_file(_hist))
+
+    if _PT_AVAILABLE:
+        pt_history = _PTFileHistory(str(_hist))
+        completer  = _SlashCompleter()
+
+        def _read_line(prompt_str: str) -> str:
+            # prompt_toolkit doesn't render ANSI codes in the prompt string,
+            # so use its FormattedText instead.
+            from prompt_toolkit.formatted_text import ANSI
+            return _pt_prompt(
+                ANSI(prompt_str),
+                history=pt_history,
+                completer=completer,
+                complete_while_typing=True,
+                style=_PT_STYLE,
+            )
+    else:
+        # readline fallback — history only, no live completion menu
+        if _readline:
+            try:
+                _readline.read_history_file(_hist)
+            except FileNotFoundError:
+                pass
+            _readline.set_history_length(500)
+            import atexit
+            atexit.register(lambda: _readline.write_history_file(_hist))
+
+        def _read_line(prompt_str: str) -> str:
+            return input(prompt_str)
 
     print(BANNER)
     info(f"folder: {agent.root}")
@@ -1942,7 +2108,7 @@ def repl(agent: Agent) -> None:
     print(f"mode:   {BOLD}{'AUTO (no confirmations)' if agent.auto else 'CONFIRM (asks first)'}{RESET}\n")
     while True:
         try:
-            line = input(f"{BOLD}{BLUE}nimbus›{RESET} ").strip()
+            line = _read_line(f"{BOLD}{BLUE}nimbus›{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nbye")
             return
@@ -2005,10 +2171,33 @@ def _handle_command(agent: Agent, line: str) -> bool:
                 agent.model = choice
                 agent.messages[0] = {"role": "system", "content": agent._system_prompt()}
                 info(f"model set to {agent.model}")
+    elif cmd in ("/fast", "/code", "/max"):
+        name = cmd[1:]
+        agent.switch_pool(name)
+        if pool_override() is not None:
+            warn("NIMBUS_MODEL_POOL is set in your environment — it overrides the "
+                 "tiers, so /nextmodel rotates that custom pool. Unset it to use "
+                 "/fast /code /max.")
+    elif cmd in ("/pool", "/pools"):
+        if pool_override() is not None:
+            print(f"\n{BOLD}Active pool:{RESET} custom (NIMBUS_MODEL_POOL override)")
+            for m in model_pool():
+                marker = f"{GREEN}*{RESET}" if m == agent.model else " "
+                print(f"  {marker} {m}")
+            print()
+        else:
+            print(f"\n{BOLD}Model tiers{RESET}  {DIM}(active: {agent.pool}){RESET}")
+            for tier, models in MODEL_POOLS.items():
+                active = f"{GREEN}●{RESET}" if tier == agent.pool else f"{DIM}○{RESET}"
+                print(f"\n  {active} {BOLD}/{tier}{RESET}")
+                for m in models:
+                    marker = f"{GREEN}*{RESET}" if m == agent.model else " "
+                    print(f"      {marker} {m}")
+            print(f"\n  {DIM}Switch with /fast, /code, /max; rotate within a tier with /nextmodel.{RESET}\n")
     elif cmd in ("/nextmodel", "/next"):
         if not agent.switch_to_next_model():
-            warn("Can't switch — set NIMBUS_MODEL_POOL with 2+ models in .env "
-                 "(the current model is the only one, or no pool is configured).")
+            warn("Can't switch — the active pool needs 2+ models. Try another tier "
+                 "(/fast /code /max) or see /pool.")
     elif cmd == "/open":
         if not arg:
             err("usage: /open <path>")
@@ -2042,7 +2231,8 @@ def _handle_command(agent: Agent, line: str) -> bool:
             print("  (no sessions for this folder)")
         else:
             for s in sessions[:20]:
-                print(f"  {s['id']}  {s.get('updated','')[:16]}  {s.get('message_count',0)} msgs  {s.get('title','')[:50]}")
+                turns = s.get("turn_count") or max(0, s.get("message_count", 1) - 1)
+                print(f"  {s['id']}  {s.get('updated','')[:16]}  {turns:>3} turns  {s.get('title','')[:50]}")
     elif cmd == "/resume":
         if not arg:
             err("usage: /resume <session-id>")
