@@ -355,6 +355,54 @@ CYAN = _c("\033[36m")
 MAGENTA = _c("\033[35m")
 
 
+_THEMES: dict[str, dict[str, str]] = {
+    "dark": {  # default — works on dark terminals
+        "RESET": "\033[0m", "BOLD": "\033[1m", "DIM": "\033[2m",
+        "RED": "\033[31m", "GREEN": "\033[32m", "YELLOW": "\033[33m",
+        "BLUE": "\033[34m", "CYAN": "\033[36m", "MAGENTA": "\033[35m",
+    },
+    "light": {  # bolder for light-background terminals
+        "RESET": "\033[0m", "BOLD": "\033[1m", "DIM": "\033[2m",
+        "RED": "\033[91m", "GREEN": "\033[32m", "YELLOW": "\033[33m",
+        "BLUE": "\033[94m", "CYAN": "\033[36m", "MAGENTA": "\033[35m",
+    },
+    "ocean": {  # blue/teal palette
+        "RESET": "\033[0m", "BOLD": "\033[1m", "DIM": "\033[2m",
+        "RED": "\033[91m", "GREEN": "\033[96m", "YELLOW": "\033[94m",
+        "BLUE": "\033[96m", "CYAN": "\033[94m", "MAGENTA": "\033[95m",
+    },
+    "monokai": {  # warm/vivid
+        "RESET": "\033[0m", "BOLD": "\033[1m", "DIM": "\033[2m",
+        "RED": "\033[91m", "GREEN": "\033[92m", "YELLOW": "\033[93m",
+        "BLUE": "\033[94m", "CYAN": "\033[96m", "MAGENTA": "\033[35m",
+    },
+    "minimal": {  # no colors
+        "RESET": "", "BOLD": "", "DIM": "",
+        "RED": "", "GREEN": "", "YELLOW": "",
+        "BLUE": "", "CYAN": "", "MAGENTA": "",
+    },
+}
+
+
+def _apply_theme(name: str) -> bool:
+    """Rebind module-level color globals to the chosen theme. Returns False if unknown."""
+    global RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, CYAN, MAGENTA
+    if name not in _THEMES:
+        return False
+    t = _THEMES[name]
+    use = _TTY or name == "minimal"
+    RESET   = t["RESET"]   if use else ""
+    BOLD    = t["BOLD"]    if use else ""
+    DIM     = t["DIM"]     if use else ""
+    RED     = t["RED"]     if use else ""
+    GREEN   = t["GREEN"]   if use else ""
+    YELLOW  = t["YELLOW"]  if use else ""
+    BLUE    = t["BLUE"]    if use else ""
+    CYAN    = t["CYAN"]    if use else ""
+    MAGENTA = t["MAGENTA"] if use else ""
+    return True
+
+
 def info(msg: str) -> None:
     print(f"{CYAN}{msg}{RESET}")
 
@@ -510,7 +558,8 @@ _BARE_JSON_TC = re.compile(
 # Only recognize these as valid bare-JSON tool calls to avoid false positives in prose.
 _KNOWN_TOOLS = frozenset({
     "list_directory", "find_files", "read_file", "write_file", "replace_in_file",
-    "run_command", "search", "repo_map", "web_fetch", "web_search", "remember",
+    "edit_file", "run_command", "search", "repo_map", "web_fetch", "web_search",
+    "web_browser", "remember",
 })
 
 def parse_text_tool_calls(content: str):
@@ -879,6 +928,15 @@ class Agent:
                 "new_string": {**s, "description": "Replacement text."},
                 "replace_all": {"type": "boolean", "description": "Replace every occurrence."}},
                ["path", "old_string", "new_string"]),
+            fn("edit_file",
+               "Edit a file by replacing a range of lines (1-based, inclusive). "
+               "Use when you know exact line numbers from read_file output. "
+               "Set new_content to empty string to delete lines.",
+               {"path": s,
+                "start_line": {"type": "integer", "description": "First line to replace (1-based)."},
+                "end_line": {"type": "integer", "description": "Last line to replace (1-based, inclusive)."},
+                "new_content": {**s, "description": "Replacement text (may span multiple lines). Empty string deletes the range."}},
+               ["path", "start_line", "end_line", "new_content"]),
             fn("run_command", "Run a shell command in the project root. Returns combined output.",
                {"command": {**s, "description": "The shell command to run."}},
                ["command"]),
@@ -890,6 +948,17 @@ class Agent:
                []),
             fn("web_fetch", "Fetch a web page and return readable text content.", {"url": {**s, "description": "HTTP or HTTPS URL to fetch."}}, ["url"]),
             fn("web_search", "Search the web. Returns top 5 results as title, URL, snippet.", {"query": {**s, "description": "Search query string."}}, ["query"]),
+            fn("web_browser",
+               "Control a headless Chromium browser — useful for JS-rendered pages or local web apps. "
+               "Requires: pip install playwright && playwright install chromium. "
+               "Actions: navigate (load URL, return page text), click (click a CSS selector), "
+               "fill (type text into a selector), screenshot (save a PNG to output_path).",
+               {"action": {**s, "description": "One of: navigate, click, fill, screenshot"},
+                "url": {**s, "description": "URL to load."},
+                "selector": {**s, "description": "CSS selector for click/fill actions."},
+                "text": {**s, "description": "Text to type (fill action)."},
+                "output_path": {**s, "description": "File path to save screenshot PNG."}},
+               ["action", "url"]),
             fn("remember", "Append a durable note to NIMBUS.md (project memory). Use for facts, conventions, commands to remember across sessions.", {"note": {**s, "description": "The note to remember."}}, ["note"]),
         ]
         if self.mcp_manager:
@@ -1164,6 +1233,53 @@ class Agent:
         info(f"  ✓ edited {self._rel(p)} ({n} replacement{'s' if n > 1 else ''}){ws_note}")
         return f"OK: edited {self._rel(p)} ({n} replacement(s)).{ws_note}"
 
+    def _tool_edit_file(self, path: str, start_line: int, end_line: int, new_content: str) -> str:
+        if self.plan:
+            return "BLOCKED: PLAN MODE is read-only."
+        p = self._resolve(path)
+        if not self._inside_root(p):
+            return "ERROR: refusing to edit outside the project root."
+        block = self._permitted('write', self._rel(p) or path)
+        if block:
+            return block
+        if not p.is_file():
+            return f"ERROR: file not found: {path}"
+        text = p.read_text(errors="replace")
+        lines = text.splitlines(keepends=True)
+        total = len(lines)
+        if total == 0:
+            return "ERROR: file is empty. Use write_file to add content."
+        if start_line < 1 or start_line > total:
+            return f"ERROR: start_line {start_line} out of range (file has {total} lines)."
+        if end_line < start_line or end_line > total:
+            return f"ERROR: end_line {end_line} out of range (start_line={start_line}, file has {total} lines)."
+        # Build replacement lines, preserving trailing newlines
+        if new_content:
+            new_lines = [l if l.endswith('\n') else l + '\n'
+                         for l in new_content.splitlines()]
+            # Honour the original file's final-line style (no trailing \n on last line)
+            if not text.endswith('\n') and new_lines:
+                new_lines[-1] = new_lines[-1].rstrip('\n')
+        else:
+            new_lines = []
+        replaced = lines[:start_line - 1] + new_lines + lines[end_line:]
+        new_text = "".join(replaced)
+        diff = self._diff(text, new_text, self._rel(p))
+        n_removed = end_line - start_line + 1
+        n_added = len(new_lines)
+        label = f"Edit file: {self._rel(p)} (lines {start_line}–{end_line}: -{n_removed} +{n_added})"
+        if not self._confirm(label, diff):
+            return "SKIPPED: user declined the edit."
+        try:
+            self._backup(p)
+            p.write_text(new_text)
+        except Exception as e:
+            return f"ERROR: cannot write {path}: {e}"
+        self._read_cache.pop(str(p.resolve()), None)
+        self._turn_reads.pop(str(p.resolve()), None)
+        info(f"  ✓ edited {self._rel(p)} (lines {start_line}–{end_line})")
+        return f"OK: edited {self._rel(p)} (replaced lines {start_line}–{end_line})."
+
     def _tool_run_command(self, command: str) -> str:
         if self.plan:
             return "BLOCKED: PLAN MODE is read-only. Investigate with read-only tools and present a concrete numbered plan instead."
@@ -1333,6 +1449,64 @@ class Agent:
             return f'ERROR: web search failed: {e}. Set TAVILY_API_KEY for reliable results.'
         return '\n'.join(results) if results else 'No results found.'
 
+    def _tool_web_browser(self, action: str, url: str = "",
+                          selector: str = "", text: str = "",
+                          output_path: str = "") -> str:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return ("ERROR: web_browser requires playwright.\n"
+                    "Install with: pip install playwright && playwright install chromium")
+        if not url.lower().startswith(('http://', 'https://')):
+            return "ERROR: only http(s) URLs are allowed."
+        try:
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(url, timeout=30000)
+                if action == "navigate":
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    body = page.evaluate("() => document.body.innerText") or ""
+                    title = page.title()
+                    browser.close()
+                    return f"Title: {title}\nURL: {page.url}\n\n{body[:8000]}"
+                elif action == "get_text":
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    body = page.evaluate("() => document.body.innerText") or ""
+                    browser.close()
+                    return body[:10000]
+                elif action == "click":
+                    if not selector:
+                        browser.close()
+                        return "ERROR: selector required for click action."
+                    page.click(selector)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                    body = page.evaluate("() => document.body.innerText") or ""
+                    browser.close()
+                    return f"Clicked {selector!r}.\n\n{body[:6000]}"
+                elif action == "fill":
+                    if not selector or not text:
+                        browser.close()
+                        return "ERROR: selector and text required for fill action."
+                    page.fill(selector, text)
+                    browser.close()
+                    return f"OK: filled {selector!r} with {text!r}"
+                elif action == "screenshot":
+                    dest = self._resolve(output_path) if output_path else (self.root / "screenshot.png")
+                    if not self._inside_root(dest):
+                        browser.close()
+                        return "ERROR: output_path is outside the project root."
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    page.screenshot(path=str(dest), full_page=True)
+                    browser.close()
+                    info(f"  ✓ screenshot saved to {self._rel(dest)}")
+                    return f"OK: screenshot saved to {self._rel(dest)}"
+                else:
+                    browser.close()
+                    return f"ERROR: unknown action {action!r}. Use: navigate, get_text, click, fill, screenshot"
+        except Exception as e:
+            return f"ERROR: browser action failed: {e}"
+
     def _tool_search(self, pattern: str, path: str = ".") -> str:
         base = self._resolve(path)
         if not self._inside_root(base):
@@ -1396,11 +1570,13 @@ class Agent:
             "read_file": self._tool_read_file,
             "write_file": self._tool_write_file,
             "replace_in_file": self._tool_replace_in_file,
+            "edit_file": self._tool_edit_file,
             "run_command": self._tool_run_command,
             "search": self._tool_search,
             "repo_map": self._tool_repo_map,
             "web_fetch": self._tool_web_fetch,
             "web_search": self._tool_web_search,
+            "web_browser": self._tool_web_browser,
             "remember": self._tool_remember,
         }
         if name.startswith("mcp__") and self.mcp_manager:
@@ -1983,7 +2159,10 @@ HELP = f"""{BOLD}Commands{RESET}
   /undo            revert all of this session's file changes
   /clear           clear the conversation history (keep the folder & settings)
   /cost, /tokens   show token usage (session totals and context window %)
+  /context         show context window usage, messages, files read/modified
   /compact         force history compaction (summarize older turns)
+  /export [file]   export this conversation to a markdown file
+  /theme [name]    switch color theme (dark/light/ocean/monokai/minimal)
   /exit, /quit     leave
 
   {BOLD}Session{RESET}
@@ -1991,6 +2170,7 @@ HELP = f"""{BOLD}Commands{RESET}
   /resume <id>     restore a saved session by ID
   /new             start a fresh session (clear history)
   /memory          print project memory (NIMBUS.md)
+  /init            create or reinitialize NIMBUS.md (project memory wizard)
 
   {BOLD}Plan mode{RESET}
   /plan            enter PLAN mode (read-only; model investigates and plans)
@@ -2031,10 +2211,14 @@ _SLASH_COMMANDS = [
     ("/compact",     "force history compaction — summarise older turns"),
     ("/cost",        "show token usage for this session"),
     ("/tokens",      "alias for /cost"),
+    ("/context",     "show context window usage, messages, and files read/modified"),
+    ("/export",      "/export [file]  — export conversation to a markdown file"),
+    ("/theme",       "/theme [name]  — switch color theme (dark/light/ocean/monokai/minimal)"),
     ("/sessions",    "list saved sessions for this folder"),
     ("/resume",      "/resume <id>  — restore a saved session by ID"),
     ("/new",         "start a fresh session"),
     ("/memory",      "print project memory (NIMBUS.md)"),
+    ("/init",        "create or reinitialize NIMBUS.md (project memory wizard)"),
     ("/plan",        "enter PLAN mode — read-only investigation"),
     ("/build",       "exit plan mode and execute the plan"),
     ("/permissions", "show effective allow / deny rules"),
@@ -2329,6 +2513,128 @@ def _handle_command(agent: Agent, line: str) -> bool:
             print(agent.mcp_manager.status())
         else:
             print("  MCP: not available (mcp package not installed or no mcpServers configured)")
+    elif cmd == "/init":
+        nimbus_md = agent.root / "NIMBUS.md"
+        if nimbus_md.is_file() and not _yes_no("NIMBUS.md already exists. Overwrite?", default_yes=False):
+            return False
+        print(f"\n{BOLD}Initialize project memory (NIMBUS.md){RESET}")
+        print(f"{DIM}Press Enter to skip any field.{RESET}\n")
+        try:
+            proj_name   = input("  Project name: ").strip() or agent.root.name
+            desc        = input("  Description: ").strip()
+            tech        = input("  Tech stack (e.g. Python, React): ").strip()
+            run_cmd     = input("  Run command (e.g. python nimbus.py): ").strip()
+            test_cmd    = input("  Test command (e.g. pytest): ").strip()
+            conventions = input("  Conventions / notes: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        parts = [f"# {proj_name}\n\n"]
+        if desc:
+            parts.append(f"{desc}\n\n")
+        parts.append("## Project Info\n\n")
+        if tech:
+            parts.append(f"- **Tech stack:** {tech}\n")
+        if run_cmd:
+            parts.append(f"- **Run:** `{run_cmd}`\n")
+        if test_cmd:
+            parts.append(f"- **Test:** `{test_cmd}`\n")
+        if conventions:
+            parts.append(f"\n## Conventions\n\n{conventions}\n")
+        parts.append("\n## nimbus memory\n")
+        content = "".join(parts)
+        try:
+            nimbus_md.write_text(content)
+            agent._read_cache.pop(str(nimbus_md.resolve()), None)
+            agent.messages[0] = {"role": "system", "content": agent._system_prompt()}
+            info(f"Created NIMBUS.md ({len(content)} bytes)")
+        except Exception as e:
+            err(f"Failed to write NIMBUS.md: {e}")
+    elif cmd == "/export":
+        filename = arg or f"nimbus-export-{time.strftime('%Y%m%dT%H%M%S')}.md"
+        out_path = (agent.root / filename).resolve()
+        if not agent._inside_root(out_path):
+            out_path = Path(filename).resolve()
+        lines = [
+            f"# nimbus session export\n\n",
+            f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}  \n",
+            f"**Model:** {agent.model}  \n",
+            f"**Folder:** {agent.root}  \n\n---\n\n",
+        ]
+        for m in agent.messages[1:]:  # skip system prompt
+            role = m.get("role", "?")
+            content = m.get("content") or ""
+            if role == "user":
+                if content.startswith("[Earlier conversation summary]"):
+                    lines.append(f"**[Summary]**\n\n{content[len('[Earlier conversation summary]'):].strip()}\n\n---\n\n")
+                elif content.startswith("Tool results"):
+                    continue
+                else:
+                    lines.append(f"**User:** {content}\n\n")
+            elif role == "assistant":
+                tcs = m.get("tool_calls", [])
+                if content.strip():
+                    lines.append(f"**nimbus:** {content.strip()}\n\n")
+                for tc in tcs:
+                    fn_name = tc.get("function", {}).get("name", "?")
+                    lines.append(f"*\\[tool: {fn_name}\\]*\n\n")
+            elif role == "tool":
+                snippet = content[:300] + "…" if len(content) > 300 else content
+                lines.append(f"*\\[tool result: {snippet}\\]*\n\n")
+        full = "".join(lines)
+        try:
+            out_path.write_text(full)
+            info(f"Exported to {out_path} ({len(full)} chars, {len(agent.messages)-1} messages)")
+        except Exception as e:
+            err(f"Failed to export: {e}")
+    elif cmd == "/context":
+        agent._estimate_context_tokens()
+        msgs = agent.messages
+        roles: dict[str, int] = {}
+        for m in msgs:
+            r = m.get("role", "?")
+            roles[r] = roles.get(r, 0) + 1
+        ctx = agent.context_tokens
+        limit = NIMBUS_CONTEXT_LIMIT
+        pct = ctx / limit * 100 if limit else 0
+        bar_len = 30
+        filled = min(int(bar_len * ctx / limit), bar_len) if limit else 0
+        bar = f"{GREEN}{'█' * filled}{DIM}{'░' * (bar_len - filled)}{RESET}"
+        print(f"\n{BOLD}Context window{RESET}")
+        print(f"  {bar} {pct:.1f}%  (~{ctx} / {limit} tokens)")
+        print(f"\n{BOLD}Messages{RESET}")
+        for role, count in sorted(roles.items()):
+            print(f"  {role:12s} {count}")
+        print(f"  {'total':12s} {len(msgs)}")
+        print(f"\n{BOLD}Model:{RESET} {agent.model}  (pool: {agent.pool})")
+        if agent._read_cache:
+            print(f"\n{BOLD}Files read this session:{RESET}")
+            for path_str in list(agent._read_cache)[:15]:
+                try:
+                    rel = str(Path(path_str).relative_to(agent.root))
+                except ValueError:
+                    rel = path_str
+                print(f"  {rel}")
+            if len(agent._read_cache) > 15:
+                print(f"  {DIM}… and {len(agent._read_cache) - 15} more{RESET}")
+        if agent.backups:
+            print(f"\n{BOLD}Files modified this session:{RESET}")
+            for path_str in list(agent.backups)[:15]:
+                try:
+                    rel = str(Path(path_str).relative_to(agent.root))
+                except ValueError:
+                    rel = path_str
+                print(f"  {rel}")
+        print()
+    elif cmd == "/theme":
+        if not arg:
+            names = ", ".join(_THEMES)
+            print(f"\n{BOLD}Available themes:{RESET} {names}")
+            print(f"{DIM}Usage: /theme <name>{RESET}\n")
+        elif _apply_theme(arg):
+            info(f"theme: {arg}")
+        else:
+            err(f"unknown theme: {arg!r}  (available: {', '.join(_THEMES)})")
     else:
         err(f"unknown command: {cmd} (try /help)")
     return False
